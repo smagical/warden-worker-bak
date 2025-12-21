@@ -1,4 +1,4 @@
-name = "warden-worker"
+name = "password"
 main = "src/entry.js"
 compatibility_date = "2025-09-19"
 keep_vars = true
