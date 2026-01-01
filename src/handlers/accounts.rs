@@ -6,7 +6,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 use worker::{query, D1PreparedStatement, Env};
 
-use super::get_batch_size;
+use super::{get_batch_size, server_password_iterations, two_factor_enabled};
 use crate::{
     auth::Claims,
     crypto::{generate_salt, hash_password_for_storage},
@@ -227,8 +227,13 @@ pub async fn register(
 
     // Generate salt and hash the password with server-side PBKDF2
     let password_salt = generate_salt()?;
-    let hashed_password =
-        hash_password_for_storage(&payload.master_password_hash, &password_salt).await?;
+    let password_iterations = server_password_iterations(&env) as i32;
+    let hashed_password = hash_password_for_storage(
+        &payload.master_password_hash,
+        &password_salt,
+        password_iterations as u32,
+    )
+    .await?;
 
     let db = db::get_db(&env)?;
     let now = Utc::now().to_rfc3339();
@@ -249,6 +254,7 @@ pub async fn register(
         master_password_hash: hashed_password,
         master_password_hint: payload.master_password_hint,
         password_salt: Some(password_salt),
+        password_iterations,
         key: payload.user_symmetric_key,
         private_key: payload.user_asymmetric_keys.encrypted_private_key,
         public_key: payload.user_asymmetric_keys.public_key,
@@ -257,6 +263,8 @@ pub async fn register(
         kdf_memory,
         kdf_parallelism,
         security_stamp: Uuid::new_v4().to_string(),
+        equivalent_domains: "[]".to_string(),
+        excluded_globals: "[]".to_string(),
         totp_recover: None,
         created_at: now.clone(),
         updated_at: now,
@@ -264,14 +272,15 @@ pub async fn register(
 
     query!(
         &db,
-        "INSERT INTO users (id, name, email, master_password_hash, master_password_hint, password_salt, key, private_key, public_key, kdf_type, kdf_iterations, kdf_memory, kdf_parallelism, security_stamp, totp_recover, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        "INSERT INTO users (id, name, email, master_password_hash, master_password_hint, password_salt, password_iterations, key, private_key, public_key, kdf_type, kdf_iterations, kdf_memory, kdf_parallelism, security_stamp, equivalent_domains, excluded_globals, totp_recover, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
          user.id,
          user.name,
          user.email,
          user.master_password_hash,
          user.master_password_hint,
          user.password_salt,
+         user.password_iterations,
          user.key,
          user.private_key,
          user.public_key,
@@ -280,6 +289,8 @@ pub async fn register(
          user.kdf_memory,
          user.kdf_parallelism,
          user.security_stamp,
+         user.equivalent_domains,
+         user.excluded_globals,
          user.totp_recover,
          user.created_at,
          user.updated_at
@@ -324,6 +335,41 @@ pub async fn revision_date(
     Ok(Json(revision_date))
 }
 
+/// GET /api/accounts/tasks
+///
+/// Vaultwarden returns an empty list here; some official clients call this endpoint.
+/// We don't implement task workflows, so always return an empty list.
+#[worker::send]
+pub async fn get_tasks() -> Result<Json<Value>, AppError> {
+    Ok(Json(json!({
+        "data": [],
+        "object": "list"
+    })))
+}
+
+/// GET /api/auth-requests
+///
+/// Bitwarden clients may call this to fetch pending "login with device" auth requests.
+/// This minimal implementation doesn't support device auth requests, so we always return an empty list.
+///
+/// Vaultwarden currently aliases this endpoint to `/api/auth-requests/pending`.
+#[worker::send]
+pub async fn get_auth_requests(claims: Claims) -> Result<Json<Value>, AppError> {
+    get_auth_requests_pending(claims).await
+}
+
+/// GET /api/auth-requests/pending
+///
+/// Stub: always returns an empty list.
+#[worker::send]
+pub async fn get_auth_requests_pending(_claims: Claims) -> Result<Json<Value>, AppError> {
+    Ok(Json(json!({
+        "data": [],
+        "continuationToken": null,
+        "object": "list"
+    })))
+}
+
 #[worker::send]
 pub async fn get_profile(
     claims: Claims,
@@ -334,12 +380,13 @@ pub async fn get_profile(
 
     let user: User = db
         .prepare("SELECT * FROM users WHERE id = ?1")
-        .bind(&[user_id.into()])?
+        .bind(&[user_id.clone().into()])?
         .first(None)
         .await?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
-    let profile = Profile::from_user(user)?;
+    let two_factor_enabled = two_factor_enabled(&db, &user_id).await?;
+    let profile = Profile::from_user(user, two_factor_enabled)?;
 
     Ok(Json(profile))
 }
@@ -385,7 +432,8 @@ pub async fn post_profile(
     .await
     .map_err(|_| AppError::Database)?;
 
-    let profile = Profile::from_user(user)?;
+    let two_factor_enabled = two_factor_enabled(&db, user_id).await?;
+    let profile = Profile::from_user(user, two_factor_enabled)?;
 
     Ok(Json(profile))
 }
@@ -443,7 +491,8 @@ pub async fn put_avatar(
     .await
     .map_err(|_| AppError::Database)?;
 
-    let profile = Profile::from_user(user)?;
+    let two_factor_enabled = two_factor_enabled(&db, user_id).await?;
+    let profile = Profile::from_user(user, two_factor_enabled)?;
 
     Ok(Json(profile))
 }
@@ -536,8 +585,13 @@ pub async fn post_password(
 
     // Generate new salt and hash the new password
     let new_salt = generate_salt()?;
-    let new_hashed_password =
-        hash_password_for_storage(&payload.new_master_password_hash, &new_salt).await?;
+    let password_iterations = server_password_iterations(&env) as i32;
+    let new_hashed_password = hash_password_for_storage(
+        &payload.new_master_password_hash,
+        &new_salt,
+        password_iterations as u32,
+    )
+    .await?;
 
     // Generate new security stamp and update timestamp
     let new_security_stamp = Uuid::new_v4().to_string();
@@ -546,9 +600,10 @@ pub async fn post_password(
     // Update user record
     query!(
         &db,
-        "UPDATE users SET master_password_hash = ?1, password_salt = ?2, key = ?3, master_password_hint = ?4, security_stamp = ?5, updated_at = ?6 WHERE id = ?7",
+        "UPDATE users SET master_password_hash = ?1, password_salt = ?2, password_iterations = ?3, key = ?4, master_password_hint = ?5, security_stamp = ?6, updated_at = ?7 WHERE id = ?8",
         new_hashed_password,
         new_salt,
+        password_iterations,
         payload.key,
         payload.master_password_hint,
         new_security_stamp,
@@ -741,6 +796,7 @@ pub async fn post_rotatekey(
     // Only update personal ciphers (organization_id is None)
     let mut cipher_statements: Vec<D1PreparedStatement> =
         Vec::with_capacity(personal_ciphers.len());
+    let mut attachment_statements: Vec<D1PreparedStatement> = Vec::new();
     for cipher in personal_ciphers {
         // id is guaranteed to exist (validated above)
         let cipher_id = cipher.id.as_ref().unwrap();
@@ -765,13 +821,37 @@ pub async fn post_rotatekey(
         )
         .map_err(|_| AppError::Database)?;
         cipher_statements.push(stmt);
+
+        // Update attachments key and encrypted filename when rotating.
+        // The Bitwarden clients send `attachments2` only during key rotation.
+        if let Some(attachments2) = &cipher.attachments2 {
+            for (attachment_id, attachment) in attachments2 {
+                let stmt = query!(
+                    &db,
+                    "UPDATE attachments SET file_name = ?1, akey = ?2, updated_at = ?3 WHERE id = ?4 AND cipher_id = ?5",
+                    attachment.file_name,
+                    attachment.key,
+                    now,
+                    attachment_id,
+                    cipher_id
+                )
+                .map_err(|_| AppError::Database)?;
+                attachment_statements.push(stmt);
+            }
+        }
     }
     db::execute_in_batches(&db, cipher_statements, batch_size).await?;
+    db::execute_in_batches(&db, attachment_statements, batch_size).await?;
 
     // Generate new salt and hash the new password
     let new_salt = generate_salt()?;
-    let new_hashed_password =
-        hash_password_for_storage(&unlock_data.master_key_authentication_hash, &new_salt).await?;
+    let password_iterations = server_password_iterations(&env) as i32;
+    let new_hashed_password = hash_password_for_storage(
+        &unlock_data.master_key_authentication_hash,
+        &new_salt,
+        password_iterations as u32,
+    )
+    .await?;
 
     // Generate new security stamp
     let new_security_stamp = Uuid::new_v4().to_string();
@@ -786,9 +866,10 @@ pub async fn post_rotatekey(
     // Update user record with new keys and password
     query!(
         &db,
-        "UPDATE users SET master_password_hash = ?1, password_salt = ?2, key = ?3, private_key = ?4, kdf_type = ?5, kdf_iterations = ?6, kdf_memory = ?7, kdf_parallelism = ?8, security_stamp = ?9, updated_at = ?10 WHERE id = ?11",
+        "UPDATE users SET master_password_hash = ?1, password_salt = ?2, password_iterations = ?3, key = ?4, private_key = ?5, kdf_type = ?6, kdf_iterations = ?7, kdf_memory = ?8, kdf_parallelism = ?9, security_stamp = ?10, updated_at = ?11 WHERE id = ?12",
         new_hashed_password,
         new_salt,
+        password_iterations,
         unlock_data.master_key_encrypted_user_key,
         payload.account_keys.user_key_encrypted_account_private_key,
         unlock_data.kdf_type,
@@ -876,8 +957,13 @@ pub async fn post_kdf(
 
     // Generate new salt and hash the new password
     let new_salt = generate_salt()?;
-    let new_hashed_password =
-        hash_password_for_storage(payload.get_new_password_hash(), &new_salt).await?;
+    let password_iterations = server_password_iterations(&env) as i32;
+    let new_hashed_password = hash_password_for_storage(
+        payload.get_new_password_hash(),
+        &new_salt,
+        password_iterations as u32,
+    )
+    .await?;
 
     // Generate new security stamp
     let new_security_stamp = Uuid::new_v4().to_string();
@@ -897,9 +983,10 @@ pub async fn post_kdf(
     // Update user record with new KDF settings and password
     query!(
         &db,
-        "UPDATE users SET master_password_hash = ?1, password_salt = ?2, key = ?3, kdf_type = ?4, kdf_iterations = ?5, kdf_memory = ?6, kdf_parallelism = ?7, security_stamp = ?8, updated_at = ?9 WHERE id = ?10",
+        "UPDATE users SET master_password_hash = ?1, password_salt = ?2, password_iterations = ?3, key = ?4, kdf_type = ?5, kdf_iterations = ?6, kdf_memory = ?7, kdf_parallelism = ?8, security_stamp = ?9, updated_at = ?10 WHERE id = ?11",
         new_hashed_password,
         new_salt,
+        password_iterations,
         new_key,
         kdf_type,
         kdf_iterations,

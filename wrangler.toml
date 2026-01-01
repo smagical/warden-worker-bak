@@ -5,6 +5,20 @@ keep_vars = true
 workers_dev = false
 preview_urls = false
 
+[durable_objects]
+bindings = [
+  # Offload CPU-heavy endpoints to Durable Objects 
+  # (100,000 requests, 13,000 GB-s duration / day in free plan),
+  # while keeping the main Worker fast for the rest.
+  #
+  # - HEAVY_DO: Rust DO, reuses existing axum router for CPU-heavy endpoints (import/login/password verify).
+  { name = "HEAVY_DO", class_name = "HeavyDo" }
+]
+
+[[migrations]]
+tag = "do_v1"
+new_sqlite_classes = ["HeavyDo"]
+
 [build]
 command = "cargo install --locked -q worker-build --version 0.7.1 && worker-build --release --locked"
 
@@ -20,15 +34,20 @@ namespace_id = "1001"
 simple = { limit = 5, period = 60 }
 
 # Static assets configuration for serving frontend
-# Frontend files should be placed in ./public directory before deployment
+# Frontend files (bw_web_builds) are expected under ./public/web-vault before deployment
 [assets]
-directory = "./public"
+directory = "./public/web-vault"
 not_found_handling = "404-page"
 html_handling = "auto-trailing-slash"
 # Only invoke Worker for API and Identity routes, serve static files directly for other routes
 run_worker_first = ["/api/*", "/identity/*"]
 
 [vars]
+# Server-side password hashing PBKDF2 iterations (stored per-user).
+# Defaults to 600000, and will be clamped to a minimum of 600000 even if set lower.
+# Existing users whose password iterations are less than this value will be upgraded on login.
+# PASSWORD_ITERATIONS = "600000"
+
 # Optional: Set the batch size for imports. Defaults to 30 if not set.
 # Set to 0 means no batching (all records imported in a single batch).
 # IMPORT_BATCH_SIZE = "30"
@@ -72,6 +91,13 @@ name = "warden-worker-dev"
 keep_vars = true
 workers_dev = false
 preview_urls = false
+
+[env.dev.vars]
+
+[env.dev.durable_objects]
+bindings = [
+  { name = "HEAVY_DO", class_name = "HeavyDo" }
+]
 
 # Dev environment also needs cron triggers
 [env.dev.triggers]

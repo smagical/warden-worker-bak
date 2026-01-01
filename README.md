@@ -66,12 +66,17 @@ It's highly recommended to deploy your own instance since the demo can hit the r
 
 ## Frontend (Web Vault)
 
-The frontend is bundled with the Worker using [Cloudflare Workers Static Assets](https://developers.cloudflare.com/workers/static-assets/). The GitHub Actions workflow automatically downloads the latest [bw_web_builds](https://github.com/dani-garcia/bw_web_builds) (Vaultwarden web vault) and deploys it together with the backend.
+The frontend is bundled with the Worker using [Cloudflare Workers Static Assets](https://developers.cloudflare.com/workers/static-assets/). The GitHub Actions workflows download a **pinned** [bw_web_builds](https://github.com/dani-garcia/bw_web_builds) (Vaultwarden web vault) release (default: `v2025.12.0`) and deploy it together with the backend. You can override it via GitHub Actions Variables (`BW_WEB_VERSION` for prod, `BW_WEB_VERSION_DEV` for dev), or set it to `latest` to follow upstream.
 
 **How it works:**
 - Static files (HTML, CSS, JS) are served directly by Cloudflare's edge network.
 - API requests (`/api/*`, `/identity/*`) are routed to the Rust Worker.
 - No separate Pages deployment or domain configuration needed.
+
+**UI overrides (optional):**
+- This project ships a small set of "lightweight self-host" UI tweaks in `public/css/`.
+- In CI/CD (and optionally locally), we apply them after extracting `bw_web_builds`:
+  - `bash scripts/apply-web-vault-overrides.sh public/web-vault`
 
 > [!NOTE]
 > Migrating from separate frontend deployment? If you previously deployed the frontend separately to Cloudflare Pages, you can delete the `warden-frontend` Pages project and re-setup the router for the worker. The frontend is now bundled with the Worker and no longer requires a separate deployment.
@@ -136,8 +141,35 @@ If the binding is missing, requests proceed without rate limiting (graceful degr
 
 ## Configuration
 
+### Durable Objects (CPU Offloading)
+
+Cloudflare Workers Free plan has a very small per-request CPU budget. Two kinds of endpoints are particularly CPU-heavy:
+
+- import endpoint: large JSON payload (typically 500kB–1MB) + parsing + batch inserts.
+- registration, login and password verification endpoint: server-side PBKDF2 for password verification.
+
+To keep the main Worker fast while still supporting these operations, Warden can **offload selected endpoints to Durable Objects (DO)**:
+
+- **Heavy DO (`HEAVY_DO`)**: implemented in Rust as `HeavyDo` (reuses the existing axum router) so CPU-heavy endpoints can run with a higher CPU budget.
+
+**How to enable/disable**
+
+Whether CPU-heavy endpoints are offloaded is determined by whether the `HEAVY_DO` Durable Object binding is configured in `wrangler.toml`.
+
+> [!NOTE]
+> Durable Objects have much higher CPU budget of 30 seconds per request in free plan(see [Cloudflare Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/)), so we can use it to offload the CPU-heavy endpoints.
+>
+> Durable Objects can incur two types of billing: compute and storage. Storage is not used in this project, and the free plan allows 100,000 requests and 13,000 GB-s duration per day, which should be more than enough for most users. See [Cloudflare Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/) for details.
+>
+> If you choose to disable Durable Objects, you may need subscribe to a paid plan to avoid being throttled by Cloudflare.
+
+### Environment Variables
+
 Configure environment variables in `wrangler.toml` under `[vars]`, or set them via Cloudflare Dashboard:
 
+* **`PASSWORD_ITERATIONS`** (Optional, Default: `600000`):
+  - PBKDF2 iterations for server-side password hashing.
+  - Minimum is 600000.
 * **`TRASH_AUTO_DELETE_DAYS`** (Optional, Default: `30`): 
   - Days to keep soft-deleted items before purge. 
   - Set to `0` or negative to disable.
@@ -154,7 +186,7 @@ Configure environment variables in `wrangler.toml` under `[vars]`, or set them v
 * **`ATTACHMENT_TOTAL_LIMIT_KB`** (Optional): 
   - Max total attachment storage per user in KB. 
   - Example: `1048576` for 1GB.
-* **`ATTACHMENT_TTL_SECS`** (Optional, Default: `300`): 
+* **`ATTACHMENT_TTL_SECS`** (Optional, Default: `300`, Minimum: `60`): 
   - TTL for attachment upload/download URLs.
 
 ### Scheduled Tasks (Cron)
@@ -165,6 +197,7 @@ The worker runs a scheduled task to clean up soft-deleted items. By default, it 
 
 - **Backup & restore:** See [Database Backup & Restore](docs/db-backup-recovery.md#github-actions-backups) for automated backups and manual restoration steps.
 - **Time Travel:** See [D1 Time Travel](docs/db-backup-recovery.md#d1-time-travel-point-in-time-recovery) to restore to a point in time.
+- **Seeding Global Equivalent Domains (optional):** See [docs/deployment.md](docs/deployment.md) for seeding in CLI deploy and CI/CD.
 - **Local dev with D1:**
   - Quick start: `wrangler dev --persist`
   - Full stack (with web vault): download frontend assets as in deployment doc, then `wrangler dev --persist`
@@ -183,7 +216,7 @@ wrangler dev --persist
 
 **Full stack (with Web Vault):**
 
-1. Download the frontend assets (see [deployment doc](docs/.md#download-the-frontend-web-vault)).
+1. Download the frontend assets (see [deployment doc](docs/deployment.md#download-the-frontend-web-vault)).
 2. Start locally:
 
    ```bash

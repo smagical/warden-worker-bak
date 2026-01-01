@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS users (
     master_password_hash TEXT NOT NULL,
     master_password_hint TEXT,
     password_salt TEXT, -- Salt for server-side PBKDF2 hashing (NULL for legacy users pending migration)
+    password_iterations INTEGER NOT NULL DEFAULT 600000, -- Per-user server-side PBKDF2 iteration count (migrated on login)
     key TEXT NOT NULL, -- The encrypted symmetric key
     private_key TEXT NOT NULL, -- encrypted asymmetric private_key
     public_key TEXT NOT NULL, -- asymmetric public_key
@@ -16,6 +17,8 @@ CREATE TABLE IF NOT EXISTS users (
     kdf_memory INTEGER, -- Argon2 memory parameter in MB (15-1024), NULL for PBKDF2
     kdf_parallelism INTEGER, -- Argon2 parallelism parameter (1-16), NULL for PBKDF2
     security_stamp TEXT,
+    equivalent_domains TEXT NOT NULL DEFAULT '[]', -- JSON: Vec<Vec<String>>
+    excluded_globals TEXT NOT NULL DEFAULT '[]', -- JSON: Vec<i32> (reserved for future global groups)
     totp_recover TEXT, -- Recovery code for 2FA
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -88,3 +91,12 @@ CREATE TABLE IF NOT EXISTS folders (
     updated_at TEXT NOT NULL,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+
+-- Global equivalent domains dataset (seeded separately, not bundled into the Worker)
+CREATE TABLE IF NOT EXISTS global_equivalent_domains (
+    type INTEGER PRIMARY KEY NOT NULL,
+    sort_order INTEGER NOT NULL,
+    domains_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_global_equivalent_domains_sort_order
+    ON global_equivalent_domains(sort_order);

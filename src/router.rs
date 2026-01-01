@@ -6,8 +6,8 @@ use std::sync::Arc;
 use worker::Env;
 
 use crate::handlers::{
-    accounts, attachments, ciphers, config, devices, emergency_access, folders, identity, import,
-    sync, twofactor, webauth,
+    accounts, attachments, ciphers, config, devices, domains, emergency_access, folders, identity,
+    import, meta, sync, twofactor, webauth,
 };
 
 pub fn api_router(env: Env) -> Router {
@@ -30,6 +30,7 @@ pub fn api_router(env: Env) -> Router {
         .route("/api/sync", get(sync::get_sync_data))
         // For on-demand sync checks
         .route("/api/accounts/revision-date", get(accounts::revision_date))
+        .route("/api/accounts/tasks", get(accounts::get_tasks))
         .route("/api/accounts/profile", get(accounts::get_profile))
         .route("/api/accounts/profile", post(accounts::post_profile))
         .route("/api/accounts/profile", put(accounts::put_profile))
@@ -45,6 +46,12 @@ pub fn api_router(env: Env) -> Router {
         .route(
             "/api/accounts/key-management/rotate-user-account-keys",
             post(accounts::post_rotatekey),
+        )
+        // Auth requests (login with device) - stub to prevent client 404s
+        .route("/api/auth-requests", get(accounts::get_auth_requests))
+        .route(
+            "/api/auth-requests/pending",
+            get(accounts::get_auth_requests_pending),
         )
         // Ciphers CRUD
         .route("/api/ciphers", get(ciphers::list_ciphers))
@@ -131,6 +138,15 @@ pub fn api_router(env: Env) -> Router {
         .route("/api/folders/{id}", delete(folders::delete_folder))
         .route("/api/folders/{id}/delete", post(folders::delete_folder))
         .route("/api/config", get(config::config))
+        // Meta endpoints (mirrors a subset of vaultwarden core/mod.rs)
+        .route("/api/alive", get(meta::alive))
+        .route("/api/now", get(meta::now))
+        .route("/api/version", get(meta::version))
+        .route("/api/hibp/breach", get(meta::hibp_breach))
+        // Settings (stubbed)
+        .route("/api/settings/domains", get(domains::get_domains))
+        .route("/api/settings/domains", post(domains::post_domains))
+        .route("/api/settings/domains", put(domains::put_domains))
         // Emergency access (stub - returns empty lists, feature not supported)
         .route(
             "/api/emergency-access/trusted",

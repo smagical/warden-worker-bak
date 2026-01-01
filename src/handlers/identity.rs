@@ -1,17 +1,21 @@
 use axum::{extract::State, Form, Json};
 use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use constant_time_eq::constant_time_eq;
+use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use worker::{query, Env};
 
 use crate::{
-    auth::Claims,
+    auth::{jwt_validation, Claims},
     crypto::{ct_eq, generate_salt, hash_password_for_storage, validate_totp},
     db,
     error::AppError,
-    handlers::allow_totp_drift,
+    handlers::{
+        allow_totp_drift, server_password_iterations,
+        twofactor::{is_twofactor_enabled, list_user_twofactors},
+    },
     models::twofactor::{RememberTokenData, TwoFactor, TwoFactorType},
     models::user::User,
 };
@@ -94,6 +98,8 @@ pub struct TokenResponse {
     force_password_reset: bool,
     #[serde(rename = "UserDecryptionOptions")]
     user_decryption_options: UserDecryptionOptions,
+    #[serde(rename = "AccountKeys")]
+    account_keys: serde_json::Value,
     #[serde(rename = "TwoFactorToken", skip_serializing_if = "Option::is_none")]
     two_factor_token: Option<String>,
 }
@@ -102,7 +108,22 @@ pub struct TokenResponse {
 #[serde(rename_all = "PascalCase")]
 pub struct UserDecryptionOptions {
     pub has_master_password: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub master_password_unlock: Option<serde_json::Value>,
     pub object: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RefreshClaims {
+    pub sub: String, // User ID
+    pub exp: usize,  // Expiration time
+    pub nbf: usize,  // Not before time
+
+    // NOTE: We intentionally do NOT implement refresh token rotation / replay detection here.
+    // Vaultwarden's default auth flow also doesn't do rotation/reuse detection; in this project we
+    // currently avoid device/session management. If we later add minimal device state, we can add
+    // refresh token rotation (jti/family) + reuse detection on top.
+    pub sstamp: String,
 }
 
 fn generate_tokens_and_response(
@@ -118,6 +139,7 @@ fn generate_tokens_and_response(
         sub: user.id.clone(),
         exp,
         nbf: now.timestamp() as usize,
+        sstamp: user.security_stamp.clone(),
         premium: true,
         name: user.name.clone().unwrap_or_else(|| "User".to_string()),
         email: user.email.clone(),
@@ -134,15 +156,11 @@ fn generate_tokens_and_response(
 
     let refresh_expires_in = Duration::days(30);
     let refresh_exp = (now + refresh_expires_in).timestamp() as usize;
-    let refresh_claims = Claims {
-        sub: user.id.clone(),
+    let refresh_claims = RefreshClaims {
+        sub: user.id,
         exp: refresh_exp,
         nbf: now.timestamp() as usize,
-        premium: true,
-        name: user.name.unwrap_or_else(|| "User".to_string()),
-        email: user.email.clone(),
-        email_verified: true,
-        amr: vec!["Application".into()],
+        sstamp: user.security_stamp,
     };
     let jwt_refresh_secret = env.secret("JWT_REFRESH_SECRET")?.to_string();
     let refresh_token = encode(
@@ -150,6 +168,34 @@ fn generate_tokens_and_response(
         &refresh_claims,
         &EncodingKey::from_secret(jwt_refresh_secret.as_ref()),
     )?;
+
+    let has_master_password = !user.master_password_hash.is_empty();
+    let master_password_unlock = if has_master_password {
+        Some(serde_json::json!({
+            "Kdf": {
+                "KdfType": user.kdf_type,
+                "Iterations": user.kdf_iterations,
+                "Memory": user.kdf_memory,
+                "Parallelism": user.kdf_parallelism
+            },
+            // This field is named inconsistently and will be removed and replaced by the "wrapped" variant in the apps.
+            // https://github.com/bitwarden/android/blob/release/2025.12-rc41/network/src/main/kotlin/com/bitwarden/network/model/MasterPasswordUnlockDataJson.kt#L22-L26
+            "MasterKeyEncryptedUserKey": user.key,
+            "MasterKeyWrappedUserKey": user.key,
+            "Salt": user.email
+        }))
+    } else {
+        None
+    };
+
+    let account_keys = serde_json::json!({
+        "publicKeyEncryptionKeyPair": {
+            "wrappedPrivateKey": user.private_key,
+            "publicKey": user.public_key,
+            "Object": "publicKeyEncryptionKeyPair"
+        },
+        "Object": "privateKeys"
+    });
 
     Ok(Json(TokenResponse {
         access_token,
@@ -165,9 +211,11 @@ fn generate_tokens_and_response(
         force_password_reset: false,
         reset_master_password: false,
         user_decryption_options: UserDecryptionOptions {
-            has_master_password: true,
+            has_master_password,
+            master_password_unlock,
             object: "userDecryptionOptions".to_string(),
         },
+        account_keys,
         two_factor_token,
     }))
 }
@@ -215,28 +263,14 @@ pub async fn token(
                 return Err(AppError::Unauthorized("Invalid credentials".to_string()));
             }
 
-            // Check for 2FA
-            let twofactors: Vec<TwoFactor> = db
-                .prepare("SELECT * FROM twofactor WHERE user_uuid = ?1 AND atype < 1000")
-                .bind(&[user.id.clone().into()])?
-                .all()
-                .await
-                .map_err(|_| AppError::Database)?
-                .results()
-                .unwrap_or_default();
+            // Check for 2FA (TOTP) for this user.
+            let twofactors: Vec<TwoFactor> = list_user_twofactors(&db, &user.id).await?;
 
             let mut two_factor_remember_token: Option<String> = None;
 
-            // Filter out Remember type - it's not a real 2FA provider, just a convenience feature
-            let real_twofactors: Vec<&TwoFactor> = twofactors
-                .iter()
-                .filter(|tf| tf.atype != TwoFactorType::Remember as i32)
-                .collect();
-
-            if !real_twofactors.is_empty() {
-                // 2FA is enabled, need to verify
-                // Only show real 2FA providers to client (not Remember)
-                let twofactor_ids: Vec<i32> = real_twofactors.iter().map(|tf| tf.atype).collect();
+            if is_twofactor_enabled(&twofactors) {
+                // Only advertise Authenticator (TOTP) as the real provider for now.
+                let twofactor_ids: Vec<i32> = vec![TwoFactorType::Authenticator as i32];
                 let selected_id = payload.two_factor_provider.unwrap_or(twofactor_ids[0]);
 
                 let twofactor_code = match &payload.two_factor_token {
@@ -249,17 +283,16 @@ pub async fn token(
                     }
                 };
 
-                // Find the selected twofactor from real_twofactors
-                let selected_twofactor = real_twofactors
-                    .iter()
-                    .find(|tf| tf.atype == selected_id && tf.enabled)
-                    .copied();
-
                 match TwoFactorType::from_i32(selected_id) {
                     Some(TwoFactorType::Authenticator) => {
-                        let tf = selected_twofactor.ok_or_else(|| {
-                            AppError::BadRequest("TOTP not configured".to_string())
-                        })?;
+                        let tf = twofactors
+                            .iter()
+                            .find(|tf| {
+                                tf.enabled && tf.atype == TwoFactorType::Authenticator as i32
+                            })
+                            .ok_or_else(|| {
+                                AppError::BadRequest("TOTP not configured".to_string())
+                            })?;
 
                         // Validate TOTP code
                         let allow_drift = allow_totp_drift(&env);
@@ -283,10 +316,9 @@ pub async fn token(
                         // Remember is handled separately - client sends remember token from previous login
                         // Check remember token against stored value for this device
                         if let Some(ref device_id) = payload.device_identifier {
-                            // Find remember token in twofactors (not real_twofactors)
-                            let remember_tf = twofactors
-                                .iter()
-                                .find(|tf| tf.atype == TwoFactorType::Remember as i32);
+                            let remember_tf = twofactors.iter().find(|tf| {
+                                tf.enabled && tf.atype == TwoFactorType::Remember as i32
+                            });
 
                             if let Some(tf) = remember_tf {
                                 // Parse stored remember tokens as JSON
@@ -408,19 +440,29 @@ pub async fn token(
                 }
             }
 
-            // Migrate legacy user to PBKDF2 if password matches and no salt exists
-            let user = if verification.needs_migration() {
-                // Generate new salt and hash the password
+            // Migrate/upgrade server-side password hashing parameters on successful verification.
+            //
+            // - Legacy users (no salt) are upgraded to server-side PBKDF2.
+            // - Existing users are upgraded if their per-user iteration count is below the configured minimum.
+            let desired_iterations = server_password_iterations(&env) as i32;
+            let needs_upgrade =
+                verification.needs_migration() || user.password_iterations < desired_iterations;
+
+            let user = if needs_upgrade {
+                // Generate new salt and hash the password using the desired iterations.
                 let new_salt = generate_salt()?;
-                let new_hash = hash_password_for_storage(&password_hash, &new_salt).await?;
+                let new_hash =
+                    hash_password_for_storage(&password_hash, &new_salt, desired_iterations as u32)
+                        .await?;
                 let now = Utc::now().to_rfc3339();
 
                 // Update user in database
                 query!(
                     &db,
-                    "UPDATE users SET master_password_hash = ?1, password_salt = ?2, updated_at = ?3 WHERE id = ?4",
+                    "UPDATE users SET master_password_hash = ?1, password_salt = ?2, password_iterations = ?3, updated_at = ?4 WHERE id = ?5",
                     &new_hash,
                     &new_salt,
+                    desired_iterations,
                     &now,
                     &user.id
                 )
@@ -433,6 +475,7 @@ pub async fn token(
                 User {
                     master_password_hash: new_hash,
                     password_salt: Some(new_salt),
+                    password_iterations: desired_iterations,
                     updated_at: now,
                     ..user
                 }
@@ -448,10 +491,10 @@ pub async fn token(
                 .ok_or_else(|| AppError::BadRequest("Missing refresh_token".to_string()))?;
 
             let jwt_refresh_secret = env.secret("JWT_REFRESH_SECRET")?.to_string();
-            let token_data = decode::<Claims>(
+            let token_data = decode::<RefreshClaims>(
                 &refresh_token,
                 &DecodingKey::from_secret(jwt_refresh_secret.as_ref()),
-                &Validation::default(),
+                &jwt_validation(),
             )
             .map_err(|_| AppError::Unauthorized("Invalid refresh token".to_string()))?;
 
@@ -464,6 +507,13 @@ pub async fn token(
                 .map_err(|_| AppError::Unauthorized("Invalid user".to_string()))?
                 .ok_or_else(|| AppError::Unauthorized("Invalid user".to_string()))?;
             let user: User = serde_json::from_value(user).map_err(|_| AppError::Internal)?;
+
+            if !constant_time_eq(
+                token_data.claims.sstamp.as_bytes(),
+                user.security_stamp.as_bytes(),
+            ) {
+                return Err(AppError::Unauthorized("Invalid refresh token".to_string()));
+            }
 
             generate_tokens_and_response(user, &env, None)
         }
