@@ -19,7 +19,7 @@ This page covers the two deployment paths. Pick the one that fits your workflow 
 
 3. **(Optional) Enable R2 Bucket for Attachments:**
 
-   If you want to use file attachments:
+   Warden uses KV for attachments storage by default. If you want to use R2 as storage backend:
 
    ```bash
    # Create the production bucket
@@ -28,7 +28,7 @@ This page covers the two deployment paths. Pick the one that fits your workflow 
 
    Then enable the R2 binding in `wrangler.toml` by uncommenting the R2 bucket configuration sections.
 
-   **Note:** Attachments are optional. If you don't enable R2 bindings, attachment functionality will be disabled but all other features will work normally.
+   **Note:** Attachments are optional. If you remove both KV and R2 bindings, attachment functionality will be disabled but all other features will work normally.
 
 4. **Configure your Database ID:**
 
@@ -123,6 +123,26 @@ Add the following secrets to your GitHub repository (`Settings > Secrets and var
 | `D1_DATABASE_ID` | yes | Your production D1 database ID |
 | `D1_DATABASE_ID_DEV` | no | Dev D1 database ID (required only if you use the `Deploy Dev` workflow on the `dev` branch) |
 
+#### How to Get Your Cloudflare Account ID
+
+1. Log in to the [Cloudflare Dashboard](https://dash.cloudflare.com/)
+2. Select your account
+3. Your Account ID is displayed in the right sidebar of the Overview page, or in the URL: `https://dash.cloudflare.com/<account-id>`
+
+#### How to Get Your Cloudflare API Token
+
+The `CLOUDFLARE_API_TOKEN` requires the following permissions:
+- **Edit Cloudflare Workers**: Required for deploying the Worker
+- **Edit D1**: Required for database migrations and backups
+- **Edit KV**: Required for attachments storage (if using KV)
+
+1. Visit [https://dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens)
+2. Click **Create Token**
+3. Use the **Edit Cloudflare Workers** template
+4. Add **Account** → **D1** under `Permissions`
+5. Select `Account Resources` and `Zone Resources`
+6. Click **Continue to Summary** and then **Create Token**
+
 ### Optional Variables
 
 #### Web Vault frontend version
@@ -148,18 +168,6 @@ To avoid bundling a large JSON file into the Worker, the dataset can be stored i
 
 If you skip seeding, `/api/settings/domains` and `/api/sync` will return `globalEquivalentDomains: []`.
 
-> [!NOTE] The `CLOUDFLARE_API_TOKEN` must have **both** Worker and D1 permissions:
-> - **Edit Cloudflare Workers** - Required for deploying the Worker
-> - **Edit D1** - Required for database migrations and backups
-> 
-> When creating the API token in Cloudflare Dashboard, make sure to add both permissions under "Account" → "Cloudflare Workers" and "Account" → "D1".
-
-### How to Get Your Cloudflare Account ID
-
-1. Log in to the [Cloudflare Dashboard](https://dash.cloudflare.com/)
-2. Select your account
-3. Your Account ID is displayed in the right sidebar of the Overview page, or in the URL: `https://dash.cloudflare.com/<account-id>`
-
 ### Usage
 
 1. **Fork or clone the repository** to your GitHub account
@@ -168,7 +176,7 @@ If you skip seeding, `/api/settings/domains` and `/api/sync` will return `global
 
 3. **(Optional) Enable R2 bucket for attachments:**
 
-   If you want to use file attachments:
+   Warden uses KV for attachments storage by default. If you want to use R2 as storage backend:
 
    1. **Create R2 buckets in Cloudflare Dashboard before running the action:**
       - Go to **Storage & databases** → **R2** → **Create bucket**
@@ -183,11 +191,14 @@ If you skip seeding, `/api/settings/domains` and `/api/sync` will return `global
 
 5. **Monitor the deployment** in the Actions tab of your repository
 
-6. **Set up tables in database manually** in the Cloudflare dashboard
-
-7. **Set environment variables** as `secret` in the Cloudflare dashboard (following the command line deployment steps):
-   - `ALLOWED_EMAILS` your-email@example.com (supports glob patterns like `*@example.com`)
+6. **Set environment variables** as `secret` in the Cloudflare dashboard (following the command line deployment steps):
+   - `ALLOWED_EMAILS` your-email@example.com (supports glob patterns like `*@example.com`, comma separated)
    - `JWT_SECRET` a long random string
    - `JWT_REFRESH_SECRET` a long random string
+
+> [!IMPORTANT]
+> The server can't work without these three environment variables. If you forget to set them, the server will crash.
+
+If you want to show a 'Create account' button in frontend, you can add `DISABLE_USER_REGISTRATION` as `text` and set it to `false`. Check [Environment Variables](../README.md#environment-variables) for more details.
 
 By default, the `*.workers.dev` domain is disabled, since it may throw 1101 error. It's highly recommended to use a custom domain instead; see [Configure Custom Domain](../README.md#configure-custom-domain-optional) for more details.
