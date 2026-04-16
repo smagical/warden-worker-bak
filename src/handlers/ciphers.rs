@@ -638,9 +638,9 @@ pub async fn move_cipher_selected(
     // Uses json_extract to get folderId from request body
     let folder_invalid: Option<Value> = db
         .prepare(
-            "SELECT 1 WHERE json_extract(?1, '$.folderId') IS NOT NULL 
+            "SELECT 1 WHERE NULLIF(json_extract(?1, '$.folderId'), '') IS NOT NULL 
              AND NOT EXISTS (
-                 SELECT 1 FROM folders WHERE id = json_extract(?1, '$.folderId') AND user_id = ?2
+                 SELECT 1 FROM folders WHERE id = NULLIF(json_extract(?1, '$.folderId'), '') AND user_id = ?2
              )",
         )
         .bind(&[body.clone().into(), user_id.clone().into()])?
@@ -657,7 +657,7 @@ pub async fn move_cipher_selected(
     // Update folder_id for all ciphers that belong to the user and are in the ids list
     // Uses json_extract for folderId and json_each for ids array
     db.prepare(
-        "UPDATE ciphers SET folder_id = json_extract(?1, '$.folderId'), updated_at = ?2 
+        "UPDATE ciphers SET folder_id = NULLIF(json_extract(?1, '$.folderId'), ''), updated_at = ?2 
          WHERE user_id = ?3 AND id IN (SELECT value FROM json_each(?1, '$.ids'))",
     )
     .bind(&[body.into(), now.into(), user_id.clone().into()])?
@@ -779,21 +779,22 @@ fn cipher_json_expr(attachments_enabled: bool) -> String {
             'viewPassword', json('true'),
             'permissions', json_object('delete', json('true'), 'restore', json('true')),
             'organizationUseTotp', json('false'),
-            'collectionIds', NULL,
+            'collectionIds', json('[]'),
             'revisionDate', c.updated_at,
             'creationDate', c.created_at,
             'deletedDate', c.deleted_at,
             'attachments', {attachments_expr},
             'name', json_extract(c.data, '$.name'),
             'notes', json_extract(c.data, '$.notes'),
-            'fields', json_extract(c.data, '$.fields'),
-            'passwordHistory', json_extract(c.data, '$.passwordHistory'),
+            'fields', COALESCE(json_extract(c.data, '$.fields'), json('[]')),
+            'passwordHistory', COALESCE(json_extract(c.data, '$.passwordHistory'), json('[]')),
             'reprompt', COALESCE(json_extract(c.data, '$.reprompt'), 0),
             'login', CASE WHEN c.type = 1 THEN json_extract(c.data, '$.login') ELSE NULL END,
             'secureNote', CASE WHEN c.type = 2 THEN json_extract(c.data, '$.secureNote') ELSE NULL END,
             'card', CASE WHEN c.type = 3 THEN json_extract(c.data, '$.card') ELSE NULL END,
             'identity', CASE WHEN c.type = 4 THEN json_extract(c.data, '$.identity') ELSE NULL END,
-            'sshKey', CASE WHEN c.type = 5 THEN json_extract(c.data, '$.sshKey') ELSE NULL END
+            'sshKey', CASE WHEN c.type = 5 THEN json_extract(c.data, '$.sshKey') ELSE NULL END,
+            'key', json_extract(c.data, '$.key')
         )",
         attachments_expr = attachments_expr,
     )
