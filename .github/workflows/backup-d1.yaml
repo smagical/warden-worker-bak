@@ -1,4 +1,6 @@
 name: Backup D1 Database (S3/WebDAV)
+permissions:
+    contents: read
 
 on:
     schedule:
@@ -167,7 +169,7 @@ jobs:
 
             - name: Setup rclone
               if: steps.backends.outputs.WEBDAV_ENABLED == 'true'
-              uses: AnimMouse/setup-rclone@v1
+              uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1
 
             - name: Configure rclone (WebDAV)
               if: steps.backends.outputs.WEBDAV_ENABLED == 'true'
@@ -355,7 +357,7 @@ jobs:
 
             - name: Setup rclone
               if: steps.backends.outputs.WEBDAV_ENABLED == 'true'
-              uses: AnimMouse/setup-rclone@v1
+              uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1
 
             - name: Configure rclone (WebDAV)
               if: steps.backends.outputs.WEBDAV_ENABLED == 'true'
