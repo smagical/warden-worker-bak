@@ -405,29 +405,6 @@ pub async fn get_tasks() -> Result<Json<Value>, AppError> {
     })))
 }
 
-/// GET /api/auth-requests
-///
-/// Bitwarden clients may call this to fetch pending "login with device" auth requests.
-/// This minimal implementation doesn't support device auth requests, so we always return an empty list.
-///
-/// Vaultwarden currently aliases this endpoint to `/api/auth-requests/pending`.
-#[worker::send]
-pub async fn get_auth_requests(claims: Claims) -> Result<Json<Value>, AppError> {
-    get_auth_requests_pending(claims).await
-}
-
-/// GET /api/auth-requests/pending
-///
-/// Stub: always returns an empty list.
-#[worker::send]
-pub async fn get_auth_requests_pending(_claims: Claims) -> Result<Json<Value>, AppError> {
-    Ok(Json(json!({
-        "data": [],
-        "continuationToken": null,
-        "object": "list"
-    })))
-}
-
 #[worker::send]
 pub async fn get_profile(
     claims: Claims,
@@ -490,17 +467,16 @@ pub async fn post_profile(
     .await
     .map_err(|_| AppError::Database)?;
 
-    notifications::publish_user_update(
-        env.as_ref(),
-        user_id,
-        UpdateType::SyncSettings,
-        &now,
-        Some(&claims.device),
-    )
-    .await;
-
     let two_factor_enabled = two_factor_enabled(&db, user_id).await?;
     let profile = Profile::from_user(user, two_factor_enabled)?;
+
+    notifications::publish_user_update(
+        (*env).clone(),
+        claims.sub,
+        UpdateType::SyncSettings,
+        now,
+        Some(claims.device),
+    );
 
     Ok(Json(profile))
 }
@@ -558,17 +534,16 @@ pub async fn put_avatar(
     .await
     .map_err(|_| AppError::Database)?;
 
-    notifications::publish_user_update(
-        env.as_ref(),
-        user_id,
-        UpdateType::SyncSettings,
-        &now,
-        Some(&claims.device),
-    )
-    .await;
-
     let two_factor_enabled = two_factor_enabled(&db, user_id).await?;
     let profile = Profile::from_user(user, two_factor_enabled)?;
+
+    notifications::publish_user_update(
+        (*env).clone(),
+        claims.sub,
+        UpdateType::SyncSettings,
+        now,
+        Some(claims.device),
+    );
 
     Ok(Json(profile))
 }
@@ -694,7 +669,7 @@ pub async fn post_password(
     .run()
     .await?;
 
-    notifications::publish_user_logout(env.as_ref(), user_id, &now, Some(&claims.device)).await;
+    notifications::publish_user_logout((*env).clone(), claims.sub, now, Some(claims.device));
 
     Ok(Json(json!({})))
 }
@@ -977,7 +952,7 @@ pub async fn post_rotatekey(
     .run()
     .await?;
 
-    notifications::publish_user_logout(env.as_ref(), user_id, &now, Some(&claims.device)).await;
+    notifications::publish_user_logout((*env).clone(), claims.sub, now, Some(claims.device));
 
     Ok(Json(json!({})))
 }
@@ -1095,7 +1070,7 @@ pub async fn post_kdf(
     .run()
     .await?;
 
-    notifications::publish_user_logout(env.as_ref(), user_id, &now, Some(&claims.device)).await;
+    notifications::publish_user_logout((*env).clone(), claims.sub, now, Some(claims.device));
 
     Ok(Json(json!({})))
 }
@@ -1149,9 +1124,10 @@ pub async fn post_sstamp(
     .run()
     .await?;
 
-    // Logout push for mobile devices will be skiped since the records of devices are deleted.
-    // This behavior is aligned with Vaultwarden.
-    notifications::publish_user_logout(env.as_ref(), user_id, &now, None).await;
+    // Known issue: Logout push for mobile devices will be skiped since the records of devices are deleted.
+    // Notifications are sent in background via waitUntil,
+    // so putting it ahead of device deletion is not guaranteed to send the logout push before the deletion.
+    notifications::publish_user_logout((*env).clone(), claims.sub, now, None);
 
     Ok(Json(json!({})))
 }
